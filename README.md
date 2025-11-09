@@ -356,6 +356,38 @@ python myagent.py start
 
 Runs the agent with production-ready optimizations.
 
+## What Changed
+
+- **Filler-aware interruptions:** `AgentSession` now verifies both the clip length and the real word count before honoring a barge-in. Brief utterances that consist only of configured filler words are ignored so the assistant keeps speaking instead of stopping on "uh" or "um."【F:livekit-agents/livekit/agents/voice/agent_session.py†L157-L216】【F:livekit-agents/livekit/agents/voice/agent_activity.py†L1110-L1129】【F:livekit-agents/livekit/agents/voice/agent_activity.py†L1276-L1290】
+- **Configurable filler filters:** Provide a comma-separated `LIVEKIT_AGENT_IGNORED_FILLERS` value (for example, `LIVEKIT_AGENT_IGNORED_FILLERS="um,uh,er"`) or pass `ignored_filler_words=[...]` when building an `AgentSession` to extend the default ignored list for your locale. These tokens are stripped before the interruption word-count check runs, preventing localized disfluencies from stopping playback.
+- **Clearer telemetry:** Debug logs now call out whether an interruption was honored or skipped because it matched the ignored-filler guard, making it easier to audit noisy environments.
+
+## What Works
+
+- Interruptions that exceed both `min_interruption_duration` and `min_interruption_words` continue to stop playback immediately, so real user intent is still captured with low latency.【F:livekit-agents/livekit/agents/voice/agent_session.py†L157-L216】【F:livekit-agents/livekit/agents/voice/agent_activity.py†L1110-L1129】
+- Filler phrases listed in `LIVEKIT_AGENT_IGNORED_FILLERS` (or provided via `ignored_filler_words`) are omitted from the transcript analysis, so background acknowledgements like "uh-huh" no longer interrupt long replies.
+- Existing STT/VAD pipelines and turn-detection strategies require no changes; the guard sits on top of the transcripts you already receive.
+
+## Known Issues
+
+- The built-in filler filter relies on the simple tokenizer in `split_words`; languages that do not tokenize well with this module may need additional customisation or a richer ignored-filler list.【F:livekit-agents/livekit/agents/tokenize/basic.py†L1-L78】【F:livekit-agents/livekit/agents/voice/agent_activity.py†L1110-L1129】
+- If your STT backend does not emit filler tokens (for example, Deepgram with `filler_words=False`), the ignored list will have no effect—set the backend to include disfluencies when you need this behaviour.【F:livekit-plugins/livekit-plugins-deepgram/livekit/plugins/deepgram/stt.py†L60-L111】
+- Debug logs for ignored interruptions require `LOG_LEVEL=debug` (or equivalent) to surface; production environments running at higher log levels will not show the skip reason.
+
+## Steps to Test
+
+1. Export your filler list: `export LIVEKIT_AGENT_IGNORED_FILLERS="um,uh,er"` (you can also pass `ignored_filler_words=[...]` directly when creating `AgentSession(...)`).
+2. Launch an example voice agent with debugging enabled: `LOG_LEVEL=debug python examples/voice_agents/basic_agent.py`.
+3. While the agent speaks, inject short filler-only phrases ("uh", "um")—the speech should continue uninterrupted, and the log will contain "ignored filler interruption" messages.
+4. Speak a longer command ("actually stop now")—the agent should stop immediately, and the log will show an honored interruption event.
+5. Review the transcript output or collected metrics to confirm that filler-only attempts are tracked as ignored while substantive utterances are processed.
+
+## Environment Details
+
+- Tested with `livekit-agents` 1.x on Python 3.11, using the Deepgram STT plugin configured to emit filler words for validation.【F:livekit-plugins/livekit-plugins-deepgram/livekit/plugins/deepgram/stt.py†L60-L111】
+- Example commands assume a Unix-like shell; adapt `export` syntax for Windows PowerShell (`$Env:LIVEKIT_AGENT_IGNORED_FILLERS = "um,uh,er"`).
+- Enable verbose logging via `LOG_LEVEL=debug` (or adjust your preferred logging configuration) to observe ignored-versus-honored interruption diagnostics during testing.
+
 ## Contributing
 
 The Agents framework is under active development in a rapidly evolving field. We welcome and appreciate contributions of any kind, be it feedback, bugfixes, features, new plugins and tools, or better documentation. You can file issues under this repo, open a PR, or chat with us in LiveKit's [Slack community](https://livekit.io/join-slack).
