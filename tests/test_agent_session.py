@@ -639,6 +639,63 @@ async def test_interrupt_during_on_user_turn_completed(
     assert conversation_events[2].item.text_content == "Here is a story about a firefighter..."
 
 
+async def test_filler_speech_ignored_during_playback() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 1.5, "Hello there", stt_delay=0.2, confidence=0.9)
+    actions.add_llm("Hi!", ttft=0.1, duration=0.3)
+    actions.add_tts(4.0, ttfb=0.2)
+
+    actions.add_user_speech(2.4, 2.8, "um", stt_delay=0.1, confidence=0.9)
+    actions.add_llm("I'm still speaking.", ttft=0.1, duration=0.3)
+    actions.add_tts(1.0, ttfb=0.2)
+
+    session = create_session(
+        actions,
+        speed_factor=speed,
+        extra_kwargs={"ignored_filler_tokens": ["um"]},
+    )
+    agent = MyAgent()
+
+    playback_finished_events: list[PlaybackFinishedEvent] = []
+    session.output.audio.on("playback_finished", playback_finished_events.append)
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert len(playback_finished_events) == 2
+    assert playback_finished_events[0].interrupted is False
+
+
+async def test_filler_speech_detected_when_silent() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 1.0, "um", stt_delay=0.2, confidence=0.9)
+    actions.add_llm("I heard you.", ttft=0.1, duration=0.3)
+    actions.add_tts(1.0, ttfb=0.2)
+
+    session = create_session(
+        actions,
+        speed_factor=speed,
+        extra_kwargs={"ignored_filler_tokens": ["um"]},
+    )
+    agent = MyAgent()
+
+    playback_finished_events: list[PlaybackFinishedEvent] = []
+    conversation_events: list[ConversationItemAddedEvent] = []
+    session.output.audio.on("playback_finished", playback_finished_events.append)
+    session.on("conversation_item_added", conversation_events.append)
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert len(playback_finished_events) == 1
+    assert playback_finished_events[0].interrupted is False
+    assert conversation_events[0].item.text_content == "um"
+    assert any(
+        event.item.role == "assistant" and event.item.type == "message"
+        for event in conversation_events
+    )
+
+
 # helpers
 
 
@@ -736,7 +793,13 @@ class FakeActions:
         self._items: list[FakeUserSpeech | FakeLLMResponse | FakeTTSResponse] = []
 
     def add_user_speech(
-        self, start_time: float, end_time: float, transcript: str, *, stt_delay: float = 0.2
+        self,
+        start_time: float,
+        end_time: float,
+        transcript: str,
+        *,
+        stt_delay: float = 0.2,
+        confidence: float | None = None,
     ) -> None:
         self._items.append(
             FakeUserSpeech(
@@ -744,6 +807,7 @@ class FakeActions:
                 end_time=end_time,
                 transcript=transcript,
                 stt_delay=stt_delay,
+                confidence=confidence,
             )
         )
 

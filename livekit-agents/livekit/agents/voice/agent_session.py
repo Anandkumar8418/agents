@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import os
 import time
 from collections.abc import AsyncIterable, Sequence
 from contextlib import AbstractContextManager, nullcontext
@@ -15,6 +16,7 @@ from typing import (
     Protocol,
     TypeVar,
     Union,
+    cast,
     overload,
     runtime_checkable,
 )
@@ -85,6 +87,7 @@ class VoiceOptions:
     use_tts_aligned_transcript: NotGivenOr[bool]
     preemptive_generation: bool
     tts_text_transforms: Sequence[TextTransforms] | None
+    ignored_filler_tokens: tuple[str, ...]
 
 
 Userdata_T = TypeVar("Userdata_T")
@@ -143,6 +146,21 @@ class VoiceActivityVideoSampler:
 DEFAULT_TTS_TEXT_TRANSFORMS: list[TextTransforms] = ["filter_markdown", "filter_emoji"]
 
 
+IGNORED_FILLERS_ENV_VAR = "LIVEKIT_VOICE_IGNORED_FILLERS"
+
+
+def _coerce_ignored_fillers(value: Sequence[str] | str | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+
+    if isinstance(value, str):
+        candidates = [token.strip() for token in value.split(",")]
+    else:
+        candidates = [token.strip() for token in value]
+
+    return tuple(token for token in candidates if token)
+
+
 class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
     def __init__(
         self,
@@ -169,6 +187,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         use_tts_aligned_transcript: NotGivenOr[bool] = NOT_GIVEN,
         tts_text_transforms: NotGivenOr[Sequence[TextTransforms] | None] = NOT_GIVEN,
         preemptive_generation: bool = False,
+        ignored_filler_tokens: NotGivenOr[Sequence[str] | str | None] = NOT_GIVEN,
         conn_options: NotGivenOr[SessionConnectOptions] = NOT_GIVEN,
         loop: asyncio.AbstractEventLoop | None = None,
         # deprecated
@@ -244,6 +263,9 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             tts_text_transforms (Sequence[TextTransforms], optional): The transforms to apply
                 to the tts input text, available built-in transforms: ``"filter_markdown"``, ``"filter_emoji"``.
                 Set to ``None`` to disable. When NOT_GIVEN, all filters will be applied.
+            ignored_filler_tokens (Sequence[str], optional): Comma-separated tokens that should
+                not interrupt active TTS playback when detected in interim transcripts.
+                Can also be configured via the ``LIVEKIT_VOICE_IGNORED_FILLERS`` environment variable.
             preemptive_generation (bool):
                 Whether to speculatively begin LLM and TTS requests before an end-of-turn is
                 detected. When True, the agent sends inference calls as soon as a user
@@ -270,6 +292,14 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
         self._video_sampler = video_sampler
 
+        filler_tokens: tuple[str, ...]
+        if is_given(ignored_filler_tokens):
+            filler_tokens = _coerce_ignored_fillers(
+                cast(Sequence[str] | str | None, ignored_filler_tokens)
+            )
+        else:
+            filler_tokens = _coerce_ignored_fillers(os.getenv(IGNORED_FILLERS_ENV_VAR))
+
         # This is the "global" chat_context, it holds the entire conversation history
         self._chat_ctx = ChatContext.empty()
         self._opts = VoiceOptions(
@@ -291,6 +321,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             ),
             preemptive_generation=preemptive_generation,
             use_tts_aligned_transcript=use_tts_aligned_transcript,
+            ignored_filler_tokens=filler_tokens,
         )
         self._conn_options = conn_options or SessionConnectOptions()
         self._started = False
