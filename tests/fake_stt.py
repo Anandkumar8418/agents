@@ -31,6 +31,7 @@ class FakeUserSpeech(BaseModel):
     end_time: float
     transcript: str
     stt_delay: float
+    confidence: float | None = None
 
     def speed_up(self, factor: float) -> FakeUserSpeech:
         obj = copy.deepcopy(self)
@@ -158,13 +159,21 @@ class FakeRecognizeStream(RecognizeStream):
     def attempt(self) -> int:
         return self._attempt
 
-    def send_fake_transcript(self, transcript: str, is_final: bool = True) -> None:
+    def send_fake_transcript(
+        self, transcript: str, *, is_final: bool = True, confidence: float | None = None
+    ) -> None:
         self._event_ch.send_nowait(
             SpeechEvent(
                 type=SpeechEventType.FINAL_TRANSCRIPT
                 if is_final
                 else SpeechEventType.INTERIM_TRANSCRIPT,
-                alternatives=[SpeechData(text=transcript, language="")],
+                alternatives=[
+                    SpeechData(
+                        text=transcript,
+                        language="",
+                        confidence=confidence or 0.0,
+                    )
+                ],
             )
         )
 
@@ -201,12 +210,20 @@ class FakeRecognizeStream(RecognizeStream):
             interim_transcript_time = fake_speech.end_time + fake_speech.stt_delay * 0.5
             if curr_time() < interim_transcript_time:
                 await asyncio.sleep(interim_transcript_time - curr_time())
-            self.send_fake_transcript(" ".join(fake_speech.transcript.split()[:2]), is_final=False)
+            self.send_fake_transcript(
+                " ".join(fake_speech.transcript.split()[:2]),
+                is_final=False,
+                confidence=fake_speech.confidence,
+            )
 
             final_transcript_time = fake_speech.end_time + fake_speech.stt_delay
             if curr_time() < final_transcript_time:
                 await asyncio.sleep(final_transcript_time - curr_time())
-            self.send_fake_transcript(fake_speech.transcript, is_final=True)
+            self.send_fake_transcript(
+                fake_speech.transcript,
+                is_final=True,
+                confidence=fake_speech.confidence,
+            )
 
         with contextlib.suppress(asyncio.InvalidStateError):
             self._stt._done_fut.set_result(None)

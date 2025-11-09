@@ -70,6 +70,9 @@ if TYPE_CHECKING:
     from .agent_session import AgentSession, TurnDetectionMode
 
 
+_FILLER_CONFIDENCE_THRESHOLD = 0.5
+
+
 _AgentActivityContextVar = contextvars.ContextVar["AgentActivity"]("agents_activity")
 _SpeechHandleContextVar = contextvars.ContextVar["SpeechHandle"]("agents_speech_handle")
 
@@ -115,6 +118,10 @@ class AgentActivity(RecognitionHooks):
         self._speech_tasks: list[asyncio.Task[Any]] = []
 
         self._preemptive_generation: _PreemptiveGeneration | None = None
+
+        self._last_transcript_text: str | None = None
+        self._last_transcript_confidence: float | None = None
+        self._ignored_filler_cache: tuple[tuple[str, ...], set[str], set[str]] | None = None
 
         self._turn_detection_mode = (
             self.turn_detection if isinstance(self.turn_detection, str) else None
@@ -915,6 +922,9 @@ class AgentActivity(RecognitionHooks):
         if self._rt_session is not None:
             self._rt_session.clear_audio()
 
+        self._last_transcript_text = None
+        self._last_transcript_confidence = None
+
     def commit_user_turn(self, *, transcript_timeout: float, stt_flush_duration: float) -> None:
         assert self._audio_recognition is not None
         self._audio_recognition.commit_user_turn(
@@ -1102,7 +1112,84 @@ class AgentActivity(RecognitionHooks):
         )
         self._schedule_speech(handle, SpeechHandle.SPEECH_PRIORITY_NORMAL)
 
-    def _interrupt_by_audio_activity(self) -> None:
+    def _normalized_filler_sets(self) -> tuple[set[str], set[str]]:
+        fillers = tuple(token.lower() for token in self._session.options.ignored_filler_tokens)
+        cache = self._ignored_filler_cache
+
+        if not fillers:
+            self._ignored_filler_cache = ((), set(), set())
+            return set(), set()
+
+        if cache is None or cache[0] != fillers:
+            token_set: set[str] = set()
+            phrase_set: set[str] = set()
+
+            for filler in fillers:
+                tokens = [
+                    tok
+                    for tok, _, _ in split_words(
+                        filler, ignore_punctuation=True, split_character=False
+                    )
+                    if tok
+                ]
+                if not tokens:
+                    continue
+
+                phrase_set.add(" ".join(tokens))
+                if len(tokens) == 1:
+                    token_set.add(tokens[0])
+
+            self._ignored_filler_cache = (fillers, token_set, phrase_set)
+
+        assert self._ignored_filler_cache is not None
+        return self._ignored_filler_cache[1], self._ignored_filler_cache[2]
+
+    @staticmethod
+    def _normalize_confidence(confidence: float | None) -> float | None:
+        if confidence is None or confidence <= 0.0:
+            return None
+        return confidence
+
+    def _should_ignore_filler_transcript(
+        self, transcript: str | None, confidence: float | None
+    ) -> bool:
+        if not transcript:
+            return False
+
+        filler_tokens, filler_phrases = self._normalized_filler_sets()
+        if not filler_tokens and not filler_phrases:
+            return False
+
+        normalized_tokens = [
+            tok
+            for tok, _, _ in split_words(
+                transcript.lower(), ignore_punctuation=True, split_character=False
+            )
+            if tok
+        ]
+        if not normalized_tokens:
+            return False
+
+        normalized_phrase = " ".join(normalized_tokens)
+        if normalized_phrase not in filler_phrases:
+            if not filler_tokens or any(tok not in filler_tokens for tok in normalized_tokens):
+                return False
+
+        normalized_confidence = self._normalize_confidence(confidence)
+        if (
+            normalized_confidence is not None
+            and normalized_confidence < _FILLER_CONFIDENCE_THRESHOLD
+        ):
+            return False
+
+        return True
+
+    def _interrupt_by_audio_activity(
+        self,
+        *,
+        transcript: str | None = None,
+        confidence: float | None = None,
+    ) -> None:
         opt = self._session.options
         use_pause = opt.resume_false_interruption and opt.false_interruption_timeout is not None
 
@@ -1121,6 +1208,38 @@ class AgentActivity(RecognitionHooks):
             if len(split_words(text, split_character=True)) < opt.min_interruption_words:
                 return
 
+        transcript = transcript or (
+            self._audio_recognition.current_transcript
+            if self._audio_recognition is not None
+            else ""
+        )
+        transcript = transcript.strip()
+        if transcript == "":
+            transcript = None
+
+        normalized_confidence = confidence
+        if normalized_confidence is None:
+            normalized_confidence = self._normalize_confidence(self._last_transcript_confidence)
+        else:
+            normalized_confidence = self._normalize_confidence(normalized_confidence)
+
+        if (
+            self._current_speech is not None
+            and not self._current_speech.interrupted
+            and self._current_speech.allow_interruptions
+            and self._should_ignore_filler_transcript(transcript, normalized_confidence)
+        ):
+            logger.debug(
+                "ignoring filler-only interruption during playback",
+                extra={
+                    "event": "voice.interruption.ignored",
+                    "transcript": transcript or "",
+                    "confidence": normalized_confidence,
+                    "ignored_filler_tokens": list(opt.ignored_filler_tokens),
+                },
+            )
+            return
+
         if self._rt_session is not None:
             self._rt_session.start_user_activity()
 
@@ -1129,6 +1248,15 @@ class AgentActivity(RecognitionHooks):
             and not self._current_speech.interrupted
             and self._current_speech.allow_interruptions
         ):
+            logger.debug(
+                "interrupting playback due to user speech",
+                extra={
+                    "event": "voice.interruption.triggered",
+                    "transcript": transcript or "",
+                    "confidence": normalized_confidence,
+                    "ignored_filler_tokens": list(opt.ignored_filler_tokens),
+                },
+            )
             self._paused_speech = self._current_speech
 
             # reset the false interruption timer
@@ -1148,6 +1276,8 @@ class AgentActivity(RecognitionHooks):
     # region recognition hooks
 
     def on_start_of_speech(self, ev: vad.VADEvent | None) -> None:
+        self._last_transcript_text = None
+        self._last_transcript_confidence = None
         self._session._update_user_state("speaking")
 
         if self._false_interruption_timer:
@@ -1177,7 +1307,10 @@ class AgentActivity(RecognitionHooks):
             return
 
         if ev.speech_duration >= self._session.options.min_interruption_duration:
-            self._interrupt_by_audio_activity()
+            self._interrupt_by_audio_activity(
+                transcript=self._last_transcript_text,
+                confidence=self._last_transcript_confidence,
+            )
 
     def on_interim_transcript(self, ev: stt.SpeechEvent, *, speaking: bool | None) -> None:
         if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.user_transcription:
@@ -1193,8 +1326,15 @@ class AgentActivity(RecognitionHooks):
             ),
         )
 
-        if ev.alternatives[0].text:
-            self._interrupt_by_audio_activity()
+        transcript = ev.alternatives[0].text
+        confidence = ev.alternatives[0].confidence
+        self._last_transcript_text = transcript or None
+        self._last_transcript_confidence = confidence
+
+        if transcript:
+            self._interrupt_by_audio_activity(
+                transcript=transcript, confidence=self._last_transcript_confidence
+            )
 
             if (
                 speaking is False
@@ -1217,6 +1357,9 @@ class AgentActivity(RecognitionHooks):
                 speaker_id=ev.alternatives[0].speaker_id,
             ),
         )
+
+        self._last_transcript_text = ev.alternatives[0].text or None
+        self._last_transcript_confidence = ev.alternatives[0].confidence
 
         self._interrupt_paused_speech_task = asyncio.create_task(
             self._interrupt_paused_speech(old_task=self._interrupt_paused_speech_task)
